@@ -1,3 +1,6 @@
 test_env/
 __pycache__/
 *.pyc
+.streamlit/secrets.toml
+venv/
+.streamlit/secrets.toml
