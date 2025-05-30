@@ -5,17 +5,88 @@ from sentence_transformers import SentenceTransformer, util
 from sklearn.feature_extraction.text import TfidfVectorizer
 import numpy as np
 from textblob import TextBlob
+from collections import Counter
+import nltk
+import uuid
+nltk.download('stopwords')  # First-time download
+from nltk.corpus import stopwords
+import string
+
+
+# ===== NEW SESSION MANAGEMENT =====
+def init_session():
+    """Initialize/reset all session state variables"""
+    st.session_state.update({
+        "messages": [],
+        "scores": [],
+        "current_question": "",
+        "selected_persona": "General",
+        "current_ideal_answer": "",
+        "jd_text": "",
+        "asked_questions": [],  # Track asked questions
+        "question_embeddings": np.array([]),  # For semantic checks
+        "follow_up_count": 0,
+        "combined_weights": {},
+        "session_id": str(uuid.uuid4()),
+        "debug_info": []  # Track errors and warnings
+    })
+
+# Initialize if needed
+if 'session_id' not in st.session_state:
+    init_session()    
+
+if 'asked_questions' not in st.session_state:  # INITIALIZE IF MISSING
+    init_session()
 
 # Initialize models
 model = SentenceTransformer('all-MiniLM-L6-v2')  # Lightweight model
 
 # ===== SCORING CONFIGURATION =====
 SCORING_WEIGHTS = {
-    "keywords": 0.4,      # Emphasize domain-specific terms
-    "semantic": 0.3,      # Answer relevance to ideal response
+    "keywords": 0.3,      # Emphasize domain-specific terms
+    "semantic": 0.5,      # Answer relevance to ideal response
     "sentiment": 0.1,     # Positivity (especially for Behavioral/HR)
-    "length": 0.2         # Encourage concise but complete answers
+    "length": 0.1         # Encourage concise but complete answers
 }
+
+# ===== NEW ANTI-REPETITION FUNCTIONS =====
+def is_duplicate_question(new_question, threshold=0.75):
+    """Check semantic similarity with previous questions"""
+    if not st.session_state.asked_questions:
+        return False
+    
+    new_embed = model.encode([new_question])
+    similarities = util.cos_sim(new_embed, st.session_state.question_embeddings)
+    return np.max(similarities.numpy()) > threshold
+
+# ===== MODIFIED FEEDBACK FORMATTING =====
+def format_feedback_content(score, breakdown_content, feedback, guidelines, example):
+    """Format feedback with auto-generation fallbacks"""
+    # Generate fallback content if missing
+    if not feedback.strip():
+        feedback = ask_groq(f"Provide brief constructive feedback for this answer: '{user_input}' to question: '{st.session_state.current_question}'") or "Could not generate feedback"
+    
+    if not example.strip():
+        example = ask_groq(f"Create a concise example answer for: '{st.session_state.current_question}'") or "Could not generate example"
+    
+    # Format guidelines nicely
+    formatted_guidelines = guidelines
+    if guidelines and not guidelines.startswith("-"):
+        formatted_guidelines = "\n- " + "\n- ".join(guidelines.split("\n"))
+    
+    return f"""
+📊 Score: {score:.1f}/10
+
+{breakdown_content}
+
+➤ Constructive Feedback  
+{feedback or 'Could not generate feedback'}
+
+
+
+➤ Example Response  
+*"{example}"*
+"""
 
 # ===== SCORING FUNCTIONS =====
 def semantic_similarity(answer, ideal_answer):
@@ -37,6 +108,41 @@ def sentiment_analysis(answer):
     analysis = TextBlob(answer)
     return analysis.sentiment.polarity
 
+def extract_top_keywords(answer, n=3):
+    """Extract most frequent meaningful keywords from answer"""
+    words = [word.lower() for word in answer.split() 
+             if word.lower() not in stopwords.words('english') 
+             and word not in string.punctuation]
+    return ", ".join([word for word, _ in Counter(words).most_common(n)])
+
+def format_score_breakdown(score, breakdown, answer):
+    """Format score breakdown in specified structure"""
+    word_count = len(answer.split())
+
+     # Get both extracted and relevant keywords
+    extracted_keywords = extract_top_keywords(answer)
+    persona_jd_keywords = list(st.session_state.combined_weights.keys())  # Add this to unified_scorer
+    
+    # Find actual matches that contributed to scoring
+    relevant_keywords = [
+        kw for kw in extracted_keywords.split(", ")
+        if kw in persona_jd_keywords
+    ]
+    
+    keyword_display = (
+        ", ".join(relevant_keywords) 
+        if relevant_keywords 
+        else "No exact matches found"
+    )
+
+    return f"""
+📊 Score: {score:.1f}/10
+- Keywords: {breakdown['keywords']:.1f} ({keyword_display})
+- Relevance: {breakdown['semantic']:.1f} ({int((breakdown['semantic']/3)*100)}% semantic match)
+- Sentiment: {breakdown['sentiment']:.1f} ({"Positive" if breakdown['sentiment'] > 0 else "Neutral" if breakdown['sentiment'] == 0 else "Negative"} tone)
+- Length: {breakdown['length']:.1f} ({word_count} words)
+"""    
+
 def unified_scorer(answer, persona, jd="", ideal_answer=""):
     """
     Consolidated scoring with all components.
@@ -47,10 +153,13 @@ def unified_scorer(answer, persona, jd="", ideal_answer=""):
         "Technical": {"algorithm": 2, "python": 3, "architecture": 2},
         "Behavioral": {"example": 2, "situation": 2, "result": 2},
         "HR": {"culture": 3, "growth": 2, "mission": 2},
-        "General": {"strength": 2, "experience": 3, "describe": 2}
+        "General": {"strength": 2, "experience": 3, "mission": 3,"describe": 2}
     }
     jd_keywords = extract_keywords(jd) if jd else []
     combined_weights = {**static_weights[persona], **{kw: 2 for kw in jd_keywords}}
+
+    # NEW LINE HERE 👇
+    st.session_state.combined_weights = combined_weights  # Track scoring keywords
     
     keyword_score = sum(
         weight * answer.lower().count(keyword)
@@ -68,7 +177,7 @@ def unified_scorer(answer, persona, jd="", ideal_answer=""):
 
     # --- 4. Length Scoring ---
     word_count = len(answer.split())
-    length_score = np.exp(-0.5 * ((word_count - 500) / 100) ** 2) * 3  # 0-3 scale
+    length_score = np.exp(-0.5 * ((word_count - 150) / 100) ** 2) * 3  # 0-3 scale
 
     # --- Combine All Scores ---
     weighted_scores = {
@@ -82,24 +191,82 @@ def unified_scorer(answer, persona, jd="", ideal_answer=""):
     
     return total_score, weighted_scores
 
-# ===== SESSION STATE INITIALIZATION =====
-required_states = {
-    "messages": [],
-    "interview_started": False,
-    "follow_up_count": 0,
-    "scores": [],
-    "current_question": "",
-    "selected_persona": "General",
-    "current_ideal_answer": ""
-}
+# ===== ROBUST PARSING FUNCTION =====
+def parse_feedback(raw: str) -> tuple:
+    """Enhanced parser with multiple fallback strategies"""
+    try:
+        # Strategy 1: Exact header matching
+        feedback_match = re.search(r"Feedback:(.*?)(?=Guidelines:|$)", raw, re.DOTALL | re.IGNORECASE)
+        guidelines_match = re.search(r"Guidelines:(.*?)(?=Example Answer:|$)", raw, re.DOTALL | re.IGNORECASE)
+        example_match = re.search(r"Example Answer:(.*?)(?=== END FORMAT ===|$)", raw, re.DOTALL | re.IGNORECASE)
+        
+        # Strategy 2: Fallback to flexible matching
+        if not feedback_match:
+            feedback_match = re.search(r"(Feedback|Analysis):(.*?)(?=Guidelines|Recommendations|$)", raw, re.DOTALL | re.IGNORECASE)
+        if not guidelines_match:
+            guidelines_match = re.search(r"Guidelines:(.*?)(?=Example|Model|$)", raw, re.DOTALL | re.IGNORECASE)
+        if not example_match:
+            example_match = re.search(r"(Example Answer|Model Response):(.*)", raw, re.DOTALL | re.IGNORECASE)
+        
+        # Extract content
+        feedback = feedback_match.group(1).strip() if feedback_match else ""
+        guidelines = guidelines_match.group(1).strip() if guidelines_match else ""
+        example = example_match.group(1).strip() if example_match else ""
+        
+        # Try to extract bullet points if guidelines are messy
+        if guidelines and "-" not in guidelines:
+            bullet_points = re.findall(r"\d+\.\s+(.*)|-\s+(.*)", guidelines)
+            if bullet_points:
+                guidelines = "\n- " + "\n- ".join([bp[0] or bp[1] for bp in bullet_points])
+        
+        return feedback, guidelines, example
+        
+    except Exception as e:
+        st.session_state.debug_info.append(f"Parse error: {str(e)}")
+        st.session_state.debug_info.append(f"Raw response: {raw[:500]}")
+        return "", "", ""
 
-for key, default_val in required_states.items():
-    st.session_state.setdefault(key, default_val)
+# ===== NEW IDEAL ANSWER GENERATION FUNCTION =====
+def generate_ideal_answer(question):
+    """Robust model answer generation with fallback"""
+    prompt = f"""
+    As an expert in interview coaching, generate a comprehensive model answer for this question:
+    "{question}"
+    
+    Structure your response:
+    1. Key principles to demonstrate
+    2. Ideal structure for the answer
+    3. Concrete examples to include
+    4. Common mistakes to avoid
+    
+    Return only the model answer text without any additional labels.
+    """
+    answer = ask_groq(prompt)
+    return answer if answer else "Could not generate model answer"
 
-# ===== GROQ API CONFIG =====
-GROQ_API_KEY = st.secrets["GROQ_API_KEY"]  # Replace with your actual key
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-MODEL = "llama3-70b-8192"
+
+# ===== MODIFIED GROQ API CONFIG =====
+def ask_groq(prompt):
+    """Get AI response with error handling"""
+    try:
+        response = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {st.secrets['GROQ_API_KEY']}"},
+            json={
+                "model": "llama3-70b-8192",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.85,  # Increased randomness
+                "max_tokens": 500,
+                "frequency_penalty": 0.5  # Anti-repetition
+            },
+            timeout=15
+        )
+        response.raise_for_status()
+        return response.json()["choices"][0]["message"]["content"]
+    except Exception as e:
+        st.error(f"API Error: {str(e)}")
+        return None
+
 
 # ===== PERSONA CONFIGURATION =====
 PERSONAS = {
@@ -109,54 +276,43 @@ PERSONAS = {
     "HR": {"emoji": "💼", "prompt": "Ask HR screening questions about:"}
 }
 
-def ask_groq(prompt):
-    """Get AI response from Groq's API"""
-    try:
-        response = requests.post(
-            GROQ_URL,
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-            json={
-                "model": MODEL,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.7
-            },
-            timeout=10
-        )
-        response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"]
-    except Exception as e:
-        st.error(f"Groq API Error: {str(e)}")
-        if 'response' in locals():
-            st.json(response.json())
-        return None
 
 # ===== STREAMLIT UI =====
-st.title("🤖 Interview Prep Buddy (Groq Powered)")
+st.title("🤖 Interview Prep Buddy")
 
 # Persona Selector
 with st.container(border=True):
     cols = st.columns([3, 1])
     with cols[0]:
+        # Get current persona index safely
+        current_index = list(PERSONAS.keys()).index(
+            st.session_state.get("selected_persona", "General")
+        )
+
         new_persona = st.radio(
             "Interview Type:",
             options=list(PERSONAS.keys()),
-            index=list(PERSONAS.keys()).index(st.session_state.selected_persona),
+            index=current_index,
             format_func=lambda x: f"{x} {PERSONAS[x]['emoji']}",
             horizontal=True,
-            key="persona_selector"
+            key="persona_selector_ui"  # Unique key for this widget
         )
     with cols[1]:
         if st.button("🔄 New Interview"):
-            for key in required_states:
-                st.session_state[key] = required_states[key]
+            init_session()
             st.rerun()
 
-    if new_persona != st.session_state.selected_persona:
+    if new_persona != st.session_state.get("selected_persona", "General"):
         st.session_state.selected_persona = new_persona
         st.rerun()
 
 # Inputs
-jd = st.text_area("Job Description:", height=150)
+jd = st.text_area("Job Description:", height=150, key="jd_text_input",
+                  value=st.session_state.get("jd_text", ""))
+# Update session state as user types
+if jd != st.session_state.get("jd_text", ""):
+    st.session_state.jd_text = jd
+
 resume = st.file_uploader("Upload Resume (PDF)", type="pdf")
 
 # Progress display
@@ -172,7 +328,7 @@ else:
 for msg in st.session_state.messages:
     st.chat_message(msg["role"]).write(msg["content"])
 
-# --- Interview Logic ---
+# ===== MODIFIED INTERVIEW LOGIC =====
 if st.button("New Question" if st.session_state.messages else "Start Interview"):
     if not jd:
         st.warning("⚠️ Please enter a Job Description first!")
@@ -185,20 +341,39 @@ if st.button("New Question" if st.session_state.messages else "Start Interview")
         except Exception as e:
             st.warning(f"Couldn't read resume: {str(e)}")
         
+    # Modified question generation with anti-repetition
     prompt = f"""
     Act as a {st.session_state.selected_persona.lower()} interviewer. 
     {PERSONAS[st.session_state.selected_persona]["prompt"]}
     Job: {jd}
     Resume: {resume_text if resume_text else "Not provided"}
+    
+    Previous questions: {st.session_state.asked_questions[-3:] if st.session_state.asked_questions else "None"}
+    Generate a unique question that hasn't been asked yet. Do NOT mention that it's a new/unasked question.
     """
     
-    question = ask_groq(prompt)
+    for _ in range(3):  # Retry up to 3 times
+        question = ask_groq(prompt)
+        if question and not is_duplicate_question(question):
+            # Store question and embedding
+            st.session_state.asked_questions.append(question)
+            new_embed = model.encode([question])
+            if st.session_state.question_embeddings.size == 0:
+                st.session_state.question_embeddings = new_embed
+            else:
+                st.session_state.question_embeddings = np.vstack(
+                    [st.session_state.question_embeddings, new_embed]
+                )
+            
+            break
+    
     if question:
-        st.session_state.current_ideal_answer = ask_groq(f"Generate a model answer for: {question}")
+        st.session_state.current_ideal_answer = generate_ideal_answer(question)
         st.session_state.messages.append({"role": "assistant", "content": question})
         st.session_state.current_question = question
         st.session_state.follow_up_count = 0
         st.rerun()
+
 
 # Handle user answers
 if user_input := st.chat_input("Your answer:"):
@@ -210,40 +385,59 @@ if user_input := st.chat_input("Your answer:"):
     )
     
     # Store score and message
-    st.session_state.scores.append(score)
-    st.session_state.messages.append({"role": "user", "content": user_input})
-    
-    # Show score breakdown
-    with st.expander("🔍 Score Breakdown"):
-        st.write(f"**Keywords**: {breakdown['keywords']:.1f}")
-        st.write(f"**Relevance**: {breakdown['semantic']:.1f}")
-        st.write(f"**Sentiment**: {breakdown['sentiment']:.1f}")
-        st.write(f"**Length**: {breakdown['length']:.1f}")
-        st.progress(score / 10)
+    #st.session_state.scores.append(score)
 
-        # Add breakdown as a system message
-    breakdown_text = (
-        f"🔍 **Score Breakdown**\n"
-        f"- Keywords: {breakdown['keywords']:.1f}\n"
-        f"- Relevance: {breakdown['semantic']:.1f}\n"
-        f"- Sentiment: {breakdown['sentiment']:.1f}\n"
-        f"- Length: {breakdown['length']:.1f}"
-    )
-    st.session_state.messages.extend([
-        {"role": "user", "content": user_input},
-        {"role": "assistant", "content": breakdown_text}
-    ])
+    # Format score breakdown
+    breakdown_content = format_score_breakdown(score, breakdown, user_input)
     
-    # Generate response based on score
+    
+    # Generate structured feedback
+    feedback_prompt = f"""
+    **INSTRUCTIONS**
+    You are an expert interview coach. Analyze this candidate response and:
+
+    1. Provide constructive feedback for their answer
+    2. Provide 3 concise guidelines for an ideal answer
+    3. Generate a model example answer
+
+    **QUESTION:** {st.session_state.current_question}
+    **CANDIDATE ANSWER:** {user_input}
+    **Ideal Guidelines:** {st.session_state.current_ideal_answer}
+   
+
+    **REQUIRED FORMAT:**
+    === BEGIN FORMAT ===
+    Feedback: [Your constructive feedback here]
+    Guidelines: 
+    - [Guideline 1]
+    - [Guideline 2]
+    - [Guideline 3]
+    Example Answer: [Your example answer here]
+    === END FORMAT ===
+
+    Do not add any additional text outside these sections. Use clear section headers exactly as shown.
+    """
+    
+    raw_feedback = ask_groq(feedback_prompt)
+    feedback, guidelines, example = parse_feedback(raw_feedback) 
+    
+   
+
+    # Combine both formats
+    feedback_content = format_feedback_content(
+        score=score,
+        breakdown_content=breakdown_content,  # Added parameter
+        feedback=feedback,
+        guidelines=guidelines,
+        example=example     
+    )
+    
+    # Store and display
+    st.session_state.messages.append({"role": "user", "content": user_input})
+    st.session_state.messages.append({"role": "assistant", "content": feedback_content})
+    
+    # Generate follow-up
     if score < 8:
-        model_answer = ask_groq(f"Suggest improvements for: {user_input}")
-        st.session_state.messages.append({
-            "role": "assistant",
-            "content": (
-            f"📝 Answer score is (Score {score:.1f}/10)\n\n"  # First line with score
-            f"**Suggested Answer**\n\n"                  # Bold heading with extra line break
-            f"{model_answer}" ) 
-    })
         st.session_state.follow_up_count = 0
     elif st.session_state.follow_up_count < 1:
         follow_up = ask_groq(f"Ask 1 short follow-up about: {user_input}")
@@ -253,14 +447,12 @@ if user_input := st.chat_input("Your answer:"):
     else:
         st.session_state.messages.append({
             "role": "assistant",
-            "content": f"✅ Great job! (Score {score}/10)"
+            "content": f"✅ Great job! (Score {score:.1f}/10)"
         })
         st.session_state.follow_up_count = 0
     
     st.rerun()
 
-if GROQ_API_KEY.startswith("gsk_"):
-    st.caption("Using Groq's free tier (500 requests/day)")
 
 
 
